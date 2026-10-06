@@ -21,3 +21,6 @@ tools/demo_scores.txt
 
 # reference manuals kept in docs/ for reading, not redistributed
 docs/*.pdf
+
+# scripts/build-osx.sh writes one log per run here
+logs/
