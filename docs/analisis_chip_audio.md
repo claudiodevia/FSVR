@@ -67,7 +67,7 @@ de operador. Lo nuevo es que `refresh_ctl` sigue siendo un sexto del total, y qu
 
 ## 2. Propuestas de memoria
 
-### M1. `FxBlock::dl[3]` no se usa nunca: 1,5 MB · idéntico bit a bit
+### M1. `FxBlock::dl[3]` no se usa nunca: 1,5 MB · idéntico bit a bit · **aplicada 2026-10-06**
 
 `grep -rn "dl\[3\]" src/` no devuelve nada. Cada `FxBlock` reserva cuatro líneas de 512 KB y sólo lee
 `dl[0..2]`; la cuarta se reserva en `init` y se borra en `clearState` sin que nadie la lea. Bajar el
@@ -134,7 +134,7 @@ Los puntos 2 (saltar el no vocal terminado) y la parte de `refresh_ctl` de `perf
 hechos: `render_chan` no calcula el ruido cuando `uegdb - s.uatt` está por debajo de −100, y
 `refresh_ctl` sale antes con `s.ueg.done()`.
 
-### P2. Memorizar la banda de ruido en `refresh_ctl` · idéntico bit a bit
+### P2. Memorizar la banda de ruido en `refresh_ctl` · idéntico bit a bit · **aplicada 2026-10-06**
 
 `refresh_ctl` llama, cada 16 muestras y por cada operador no vocal vivo, a `noise_band` (tres o cuatro
 interpolaciones y dos `pow(m, skirt)`), a `ures` (un `pow(10, …)`), a `noise_band_var` y a `db2lin`, y
@@ -145,7 +145,7 @@ son funciones puras de enteros. En Vox Morph el perfil pone `noise_band`, `ures`
 2,6 puntos de los 27; la ganancia esperada es de ese orden en los parches que usan los ocho operadores
 no vocales y nula en los demás.
 
-### P3. Cálculos por muestra que son constantes en los efectos · idéntico bit a bit
+### P3. Cálculos por muestra que son constantes en los efectos · idéntico bit a bit · **aplicada 2026-10-06** (las cuatro filas de la tabla y el `pow(10, 0)` del wah)
 
 Los efectos son un 5 % en Vox Morph, pero algunos tipos hacen libm por muestra sobre valores que sólo
 cambian en `configure`. Moverlos a `configure` con la misma expresión no cambia ningún bit:
@@ -164,9 +164,16 @@ Dos casos más son caros pero no se pueden mover sin cambiar la salida, y quedan
   filtro cada N muestras no lo es.
 - **`dist_stage`** (`:610`) hace dos `pow` por muestra y canal. Son inherentes a la curva elegida.
 
-### P4. Tiempo real: el hilo de audio puede bloquearse · no afecta a la salida
+### P4. Tiempo real: el hilo de audio puede bloquearse · no afecta a la salida · **medida, no se aplica**
 
-No es rendimiento medio sino cortes (xruns), y es lo que un usuario del plug-in notaría:
+**Corrección del 2026-10-06, después de medir.** Lo que sigue describe el mecanismo correctamente, pero
+exageraba el riesgo. Medido con `Device` en el M1 Pro (Release): `loadRomPerformance` retiene el candado
+0,5 µs de media y 2,8 µs en el peor de las 384 performances; `getState`, 26 µs de media y 66 µs en el
+peor; `setState`, 13 µs y 38 µs; y `FxBlock::clearState`, 22 µs con M1 aplicada (28 µs antes). Un bloque
+de 256 muestras a 48 kHz son 5333 µs, y uno de 32 muestras, 667 µs: la peor espera es como mucho un 10 %
+del bloque más pequeño habitual. Una reescritura sin candados no se justifica con estos números; si un
+host con buffers muy cortos diera cortes al cargar, se volvería a medir allí. Lo que sigue queda como
+descripción del mecanismo:
 
 - `Synth::render` toma `std::lock_guard` sobre `mtx`, que es **bloqueante**. El plug-in hace
   `try_lock` sobre su propio `ctl`, pero llama a `dev.process` lo consiga o no, y el trabajador entra en
@@ -234,7 +241,28 @@ También se probó `-O2` frente a `-O3` con clang en ARM: mismo hash y mismo tie
 
 ---
 
-## 5. Observaciones laterales
+## 5. Resultado del primer grupo (2026-10-06)
+
+Aplicadas M1, P2 y P3; P4 se midió y no se aplica (sección 3). Todo en el M1 Pro, Release:
+
+| comprobación | resultado |
+|---|---|
+| hash del arnés, 8 performances (apéndice A) | `4cd6c1a19afc3744` antes y después |
+| hash por tipo de efecto, 29 de variación y 41 de inserción, cuatro juegos de parámetros cada uno | idéntico en los 70 |
+| WAV de `render_capture` con `-P 19`, `-P 24` y `-P 78`, binario anterior frente a nuevo | mismo SHA-1 |
+| `tools/regress.py`, huella del binario anterior y comparación con el nuevo | 19 de 19 |
+| `ctest` (effects, engine), `check_formant`, `check_presets` | pasan |
+| tiempo total del arnés, mejor de cinco | 7,60 s → 7,14 s (−6 %) |
+| A020 Vox Morph, mejor de cinco | 1,613 s → 1,558 s (−3,4 %) |
+| memoria de las líneas de retardo de efectos | 6,63 MB → 5,13 MB |
+
+La mejora de tiempo es mayor en el total que en Vox Morph porque M1 también reduce lo que el sistema
+tiene que tocar en memoria y P2 actúa en todos los parches con ruido. Lo que más CPU dará sigue siendo
+P1, que cambia la salida.
+
+---
+
+## 6. Observaciones laterales
 
 - **`build/` está configurado en Debug** (`CMAKE_BUILD_TYPE:STRING=Debug` en `build/CMakeCache.txt`),
   aunque `CMakeLists.txt` pone Release por defecto si no se indica nada. Quien mida con ese árbol obtendrá
@@ -246,7 +274,7 @@ También se probó `-O2` frente a `-O3` con clang en ARM: mismo hash y mismo tie
 
 ---
 
-## 6. Orden recomendado
+## 7. Orden recomendado
 
 | # | propuesta | salida | esfuerzo | ganancia |
 |---|---|---|---|---|

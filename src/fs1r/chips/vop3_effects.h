@@ -77,7 +77,7 @@ struct Biq {                                     // RBJ biquad, transposed form 
     void bypass() { b0 = 1; b1 = b2 = a1 = a2 = 0; }
     void set(int kind, double sr, double f, double q, double gdb) {   // 0 lp 1 hp 2 bp 3 peak 4 lowshelf 5 highshelf 6 notch
         f = std::min(std::max(f, 10.0), sr * 0.47);
-        double w = 2 * PI * f / sr, cw = cos(w), sw = sin(w), al = sw / (2 * q), A = pow(10.0, gdb / 40.0), a0;
+        double w = 2 * PI * f / sr, cw = cos(w), sw = sin(w), al = sw / (2 * q), A = gdb == 0 ? 1.0 : pow(10.0, gdb / 40.0), a0;
         switch (kind) {
         case 0: a0 = 1 + al; b0 = (1 - cw) / 2 / a0; b1 = (1 - cw) / a0; b2 = b0; a1 = -2 * cw / a0; a2 = (1 - al) / a0; break;
         case 1: a0 = 1 + al; b0 = (1 + cw) / 2 / a0; b1 = -(1 + cw) / a0; b2 = b0; a1 = -2 * cw / a0; a2 = (1 - al) / a0; break;
@@ -148,21 +148,24 @@ struct FxBlock {
     FxSlot slot = FX_REVERB; int type = 0; double sr = 44100;
     int w[16] = {}, b[8] = {};                 // decoded parameter words / bytes for this block
     // state
-    FxLine dl[4]; FxLine er; FxTail tail;
+    FxLine dl[3]; FxLine er; FxTail tail;
     Biq eqLo, eqMid, eqHi, lpf, hpf, wah, extra;
     FxLfo lfo, lfo2; FxEnv env;
     double ap[2][12] = {}; double fbz[2] = {}, z[2] = {}, hold[2] = {}; int srCount = 0; double srHold[2] = {};
     double gain = 1;
+    // Per-type constants the sample loop used to recompute every sample (gate and compressor threshold,
+    // Lo-Fi quantizer step and output gain). Set in configure_var_ins from the same words.
+    double thLin = 1, lofiQ = 1, lofiOut = 1;
 
     void init(double sampleRate) {
         sr = sampleRate;
         int big = (int)(1.5 * sr);              // 1365 ms of delay, the longest documented time
-        for (int i = 0; i < 4; i++) dl[i].init(big);
+        for (int i = 0; i < 3; i++) dl[i].init(big);
         er.init((int)(0.25 * sr));
         tail.init(sr);
     }
     void clearState() {
-        for (int i = 0; i < 4; i++) dl[i].clear();
+        for (int i = 0; i < 3; i++) dl[i].clear();
         er.clear(); tail.clear();
         eqLo.reset(); eqMid.reset(); eqHi.reset(); lpf.reset(); hpf.reset(); wah.reset(); extra.reset();
         memset(ap, 0, sizeof ap); memset(fbz, 0, sizeof fbz); memset(z, 0, sizeof z); memset(hold, 0, sizeof hold);
@@ -261,9 +264,11 @@ struct FxBlock {
         case C_ENHANCER:
             hpf.set(1, sr, fx_freq_hz(w[0]), 0.7, 0); break;
         case C_GATE:
-            env.set(fx_attack_ms(w[0]), fx_release_ms(w[1]), sr); break;
+            env.set(fx_attack_ms(w[0]), fx_release_ms(w[1]), sr);
+            thLin = pow(10.0, fx_thresh_db(w[2]) / 20.0); break;
         case C_COMP:
-            env.set(fx_attack_ms(w[0]), fx_release_ms(w[1]), sr); break;
+            env.set(fx_attack_ms(w[0]), fx_release_ms(w[1]), sr);
+            thLin = pow(10.0, fx_thresh_db(w[2]) / 20.0); break;
         case C_DIST: case C_OVERDRIVE: case C_AMPSIM:
             configure_dist(); break;
         case C_DELAY_LCR: case C_DELAY_LR: case C_ECHO: case C_CROSS: case C_KARAOKE:
@@ -273,6 +278,7 @@ struct FxBlock {
             if (w[3] > 0) hpf.set(1, sr, fx_freq_hz(w[3]), 0.7, 0);
             if (w[4] < 60) lpf.set(0, sr, fx_freq_hz(w[4]), 0.7, 0); break;
         case C_LOFI:
+            lofiQ = pow(2.0, clampi(w[6], 0, 6) + 4 - 1); lofiOut = pow(10.0, (w[2] - 6) / 20.0);
             if (w[3] < 60) lpf.set(0, sr, fx_freq_hz(w[3]), fx_q(w[5]), 0); break;
         case C_AMBIENCE: case C_ER: case C_GATEREV:
             tail.set(sr, 0.6, 0.8, 5, 2);
@@ -282,6 +288,7 @@ struct FxBlock {
             env.set(5.0, 170.0, sr); configure_dist(); break;
         case C_COMPDIST:                            // Comp+Dist: attack 0x11E; Cmp+DS+Dly, Cmp+OD+Dly: attack 0x11C (Data List p.30)
             if (type == 25) env.set(fx_attack_ms(w[11]), fx_release_ms(w[12]), sr); else env.set(fx_attack_ms(w[10]), fx_release_ms(w[11]), sr);
+            thLin = pow(10.0, fx_thresh_db(w[type == 25 ? 13 : 12]) / 20.0);
             configure_dist(); break;
         default: break;
         }
@@ -401,7 +408,7 @@ struct FxBlock {
                 double x = (s ? inR : inL) + fbz[s] * fb;
                 double m = 0.5 + 0.5 * lfo.sine(s ? (common == C_PHASER2 ? fx_unit(w[12]) - 0.5 : 0.5) : 0.0);
                 double f = 200.0 * fm::exp2(shift * 3.0 + m * depth * 4.0);
-                double g = (1 - tan(PI * std::min(f, sr * 0.45) / sr)) / (1 + tan(PI * std::min(f, sr * 0.45) / sr));
+                double tn = tan(PI * std::min(f, sr * 0.45) / sr), g = (1 - tn) / (1 + tn);
                 for (int i = 0; i < stages; i++) { double y = g * x + ap[s][i]; ap[s][i] = x - g * y; x = y; }
                 fbz[s] = x;
                 (s ? R : L) = shelves(s, ((s ? inR : inL) + x) * 0.5);
@@ -484,19 +491,19 @@ struct FxBlock {
             L = inL + fm::tanh(hL * drive) * mix; R = inR + fm::tanh(hR * drive) * mix;
             break; }
         case C_GATE: {
-            double th = pow(10.0, fx_thresh_db(w[2]) / 20.0), lvl = fx_unit(w[3]) * 2;
+            double lvl = fx_unit(w[3]) * 2;
             double e = env.run((fabs(inL) + fabs(inR)) * 0.5);
-            double g = e > th ? 1.0 : 0.0;
+            double g = e > thLin ? 1.0 : 0.0;
             z[0] += (g - z[0]) * 0.002;
             L = inL * z[0] * lvl; R = inR * z[0] * lvl;
             break; }
         case C_COMP: case C_COMPDIST: {
-            int ai, ri, ti, rt, drv = -1, outw = -1;
-            if (common == C_COMP) { ai = 0; ri = 1; ti = 2; rt = 3; outw = 4; }
-            else if (type == 25) { ai = 11; ri = 12; ti = 13; rt = 14; drv = 0; outw = 4; }
-            else { ai = 10; ri = 11; ti = 12; rt = 13; drv = 3; outw = 4; }   // Cmp+DS+Dly / Cmp+OD+Dly (Data List p.30)
-            (void)ai; (void)ri;
-            double th = pow(10.0, fx_thresh_db(w[ti]) / 20.0), ratio = fx_ratio(w[rt]);
+            // The threshold words (2, 13 and 12 in the three layouts) are read once, into thLin, by configure.
+            int rt, drv = -1, outw = -1;
+            if (common == C_COMP) { rt = 3; outw = 4; }
+            else if (type == 25) { rt = 14; drv = 0; outw = 4; }
+            else { rt = 13; drv = 3; outw = 4; }   // Cmp+DS+Dly / Cmp+OD+Dly (Data List p.30)
+            double th = thLin, ratio = fx_ratio(w[rt]);
             double e = env.run((fabs(inL) + fabs(inR)) * 0.5) + 1e-9;
             double g = e > th ? pow(th / e, 1.0 - 1.0 / ratio) : 1.0;
             L = inL * g; R = inR * g;
@@ -534,12 +541,12 @@ struct FxBlock {
             // put the factory setting of 1 into a 1-bit quantizer, which rounds every sample to zero.
             // Bit Assign (w[6], 0-6) is the depth. ponytail: mapped onto a plain 4-10 bit quantizer
             // rather than modelled as DPCM, which is what the chip does. INFERRED either way.
-            int bits = clampi(w[6], 0, 6) + 4; double q = pow(2.0, bits - 1);
+            double q = lofiQ;   // 2^(bits - 1), bits = w[6] + 4, set by configure
             int div = std::max(1, (int)(sr / std::max(375.0, 48000.0 / std::max(1, (int)(w[0] + 1)))));
             if (++srCount >= div) { srCount = 0; srHold[0] = inL; srHold[1] = inR; }
             L = floor(srHold[0] * q + 0.5) / q; R = floor(srHold[1] * q + 0.5) / q;
             L = lpf.run(0, L); R = lpf.run(1, R);
-            double o = pow(10.0, (w[2] - 6) / 20.0); L *= o; R *= o;   // Output Gain -6..+36 dB, not v-64
+            L *= lofiOut; R *= lofiOut;   // Output Gain -6..+36 dB, not v-64 (configure)
             break; }
         case C_AMBIENCE: {
             int d = (int)(fx_ms(w[0]) * 0.001 * sr); double s = w[1] ? -1.0 : 1.0;

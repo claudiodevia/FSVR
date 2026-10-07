@@ -155,6 +155,12 @@ void Synth::refresh_ctl(Chan& C) {
         // skirt. The gain is the band's PEAK, not its RMS, which is what the fit measured; the RMS follows
         // from the coefficients and is what the resonance carrier is set against.
         int ureg = clampi(C.ubwReg[o] + C.vcBw[o][1], 0, 127);
+        // Ours, and bit-identical: the band is a pure function of the register, the skirt and the
+        // resonance, which move with a controller or an Fseq frame rather than every refresh, so it is
+        // only worked out again when one of the three changes. MEASURED 2026-10-06 on A020 Vox Morph:
+        // noise_band, ures and their pow() were 2.8 % of the render (docs/analisis_chip_audio.md, P2).
+        if (ureg == s.nKey[0] && u.skirt == s.nKey[1] && u.res == s.nKey[2]) continue;
+        s.nKey[0] = ureg; s.nKey[1] = u.skirt; s.nKey[2] = u.res;
         NoiseBand nb = noise_band(ureg, u.skirt);
         s.na = nb.a1; s.na2 = nb.a2;
         double resDc, resNoise; ures(ureg, u.res, resDc, resNoise);
